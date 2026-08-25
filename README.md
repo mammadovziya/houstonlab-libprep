@@ -84,6 +84,10 @@ python -m unittest discover -s tests -v
 [Dimorphite-DL](https://github.com/durrantlab/dimorphite_dl) ·
 [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit)
 
+## Authors
+
+Ibrahim Ayvazov and Ziya Mammadov
+
 ## License
 
 MIT
