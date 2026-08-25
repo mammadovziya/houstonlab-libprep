@@ -90,4 +90,5 @@ Ibrahim Ayvazov and Ziya Mammadov
 
 ## License
 
-MIT
+Apache License 2.0. Bundled fonts remain under the SIL Open Font License 1.1;
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
