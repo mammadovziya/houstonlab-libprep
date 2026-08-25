@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ job.name }} · LibPrep{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block body %}
+<div class="app-shell">
+  {% include "_app_header.html" %}
+  <main class="app-main narrow-main">
+    <a class="back-link" href="{{ app_url('/dashboard') }}">← Back to runs</a>
+    <section class="job-hero">
+      <div><div class="job-kicker"><span class="status-pill status-{{ job.status }}" data-job-status><i></i>{{ job.status | title }}</span><span>#{{ job.id }}</span></div><h1>{{ job.name }}</h1><p>{{ job.input_count }} supplier file{{ '' if job.input_count == 1 else 's' }} · {{ job.preset | title }} recipe · created {{ job.created_at | displaytime }}</p></div>
+      {% if job.status in ['queued', 'running'] %}<form action="{{ app_url('/jobs/' ~ job.id ~ '/cancel') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-danger" type="submit">CANCEL RUN</button></form>{% endif %}
+    </section>
+
+    <section class="progress-card" data-job-poll="{{ job.id }}" data-terminal="{{ '1' if job.status in ['succeeded','failed','canceled'] else '0' }}">
+      <div><p class="mini-label">Current stage</p><h2 data-job-stage>{{ job.stage }}</h2><p data-job-message>{{ job.progress_message }}</p></div>
+      <dl><div><dt>Started</dt><dd>{{ job.started_at | displaytime }}</dd></div><div><dt>Output</dt><dd>{{ job.output_bytes | filesize }}</dd></div></dl>
+    </section>
+
+    <div class="detail-grid">
+      <section class="table-card detail-card"><div class="card-heading"><div><h2>Files</h2><p>Inputs and generated deliverables</p></div></div>
+        <div class="file-list">{% for file in files %}<div class="file-row"><span class="file-icon">{{ 'IN' if file.kind == 'input' else ('CS' if file.kind == 'custom_smarts' else 'OUT') }}</span><div><b>{{ file.filename }}</b><small>{{ file.kind.replace('_',' ') | title }} · {{ file.size_bytes | filesize }}</small></div><a href="{{ app_url('/files/' ~ file.id ~ '/download') }}">DOWNLOAD</a></div>{% else %}<div class="empty-inline">Outputs will appear here after the run completes.</div>{% endfor %}</div>
+      </section>
+      <section class="table-card detail-card"><div class="card-heading"><div><h2>Recipe</h2><p>Parameters captured with this run</p></div></div>
+        <dl class="recipe-list"><div><dt>Preset</dt><dd>{{ job.preset | title }}</dd></div>{% for key, value in job.params.items() %}<div><dt>{{ key.replace('_',' ') | title }}</dt><dd>{{ value }}</dd></div>{% endfor %}</dl>
+      </section>
+    </div>
+
+    {% if job.error_message %}<section class="log-card error-log"><div class="card-heading"><div><h2>Failure detail</h2><p>The final worker output is shown below.</p></div></div><pre>{{ job.error_message }}</pre></section>{% endif %}
+    {% if log_tail %}<section class="log-card"><div class="card-heading"><div><h2>Pipeline log</h2><p>Latest 80 lines</p></div></div><pre>{{ log_tail }}</pre></section>{% endif %}
+  </main>
+</div>
+{% endblock %}

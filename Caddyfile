@@ -1,0 +1,7 @@
+{$LIBPREP_DOMAIN} {
+    encode zstd gzip
+    request_body {
+        max_size 10GB
+    }
+    reverse_proxy web:8000
+}

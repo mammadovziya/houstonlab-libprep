@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Runs · LibPrep{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block body %}
+<div class="app-shell">
+  {% include "_app_header.html" %}
+  <main class="app-main">
+    <section class="page-heading dashboard-heading">
+      <div><h1>Preparation runs</h1><p>Submit supplier catalogues and download the processed results.</p></div>
+      <a class="button button-primary" href="{{ app_url('/jobs/new') }}">New run</a>
+    </section>
+
+    {% if is_staff and pending_count %}<a class="approval-banner" href="{{ app_url('/admin/users?status=pending') }}"><span><b>{{ pending_count }} registration{{ '' if pending_count == 1 else 's' }}</b> waiting for review</span><span>REVIEW ACCESS</span></a>{% endif %}
+
+    <section class="summary-grid">
+      <article><span>Total runs</span><strong>{{ stats.total }}</strong><small>visible to you</small></article>
+      <article><span>In progress</span><strong>{{ stats.running + stats.queued }}</strong><small>{{ stats.queued }} queued</small></article>
+      <article><span>Completed</span><strong>{{ stats.succeeded }}</strong><small>results ready</small></article>
+      <article class="worker-card"><span>GPU worker</span><strong class="worker-state {{ 'online' if worker_online else 'offline' }}"><i></i>{{ 'Online' if worker_online else 'Offline' }}</strong><small>{{ 'accepting jobs' if worker_online else 'start worker service' }}</small></article>
+    </section>
+
+    <section class="table-card">
+      <div class="card-heading"><div><h2>Recent runs</h2><p>{% if is_staff %}All user workloads{% else %}Your latest pipeline activity{% endif %}</p></div></div>
+      {% if jobs %}
+      <div class="table-scroll"><table class="runs-table"><thead><tr><th>Run</th>{% if is_staff %}<th>Owner</th>{% endif %}<th>Recipe</th><th>Inputs</th><th>Status</th><th>Created</th><th></th></tr></thead>
+      <tbody>{% for job in jobs %}<tr>
+        <td><a class="run-name" href="{{ app_url('/jobs/' ~ job.id) }}">{{ job.name }}</a><small>#{{ job.id[:8] }}</small></td>
+        {% if is_staff %}<td><span>{{ job.owner_name }}</span><small>{{ job.owner_email }}</small></td>{% endif %}
+        <td><span class="recipe-name">{{ job.preset | title }}</span></td>
+        <td><span>{{ job.input_count }} file{{ '' if job.input_count == 1 else 's' }}</span><small>{{ job.input_bytes | filesize }}</small></td>
+        <td><span class="status-pill status-{{ job.status }}"><i></i>{{ job.status | title }}</span><small>{{ job.stage }}</small></td>
+        <td><span>{{ job.created_at | displaytime }}</span></td>
+        <td><a class="row-arrow" href="{{ app_url('/jobs/' ~ job.id) }}" aria-label="Open {{ job.name }}">OPEN</a></td>
+      </tr>{% endfor %}</tbody></table></div>
+      {% else %}<div class="empty-state"><h3>No preparation runs</h3><p>Upload a supplier catalogue to create the first run.</p><a class="button button-primary" href="{{ app_url('/jobs/new') }}">Create run</a></div>{% endif %}
+    </section>
+  </main>
+</div>
+{% endblock %}

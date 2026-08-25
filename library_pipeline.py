@@ -1,10 +1,15 @@
 import argparse
 import csv
+import fcntl
 import gc
 import hashlib
 import json
+import math
 import os
+import random
+import secrets
 import shutil
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -20,7 +25,12 @@ from rdkit.Chem.EnumerateStereoisomers import (
     StereoEnumerationOptions,
 )
 
-BYTES_PER_CONFORMER = 4_500
+DEFAULT_RANDOM_SEED = 0xF00D
+MIN_BYTES_PER_CONFORMER = 4_500
+DISK_SAMPLE_SIZE = 1_000
+DISK_SAFETY_FACTOR = 1.25
+DISK_FREE_MARGIN = 0.90
+FAILURE_EXAMPLE_LIMIT = 100
 
 PRESETS = {
     "docking": {
@@ -49,22 +59,34 @@ PRESETS = {
 
 
 def _build_dimorphite_wrapper():
-   
-    try:
-        from dimorphite_dl.protonate import protonate_smiles as _p
-
+    def wrap_smiles_api(protonate):
         def fn(smi, min_ph, max_ph, precision):
             try:
-                return _p(smi, min_ph=min_ph, max_ph=max_ph, precision=precision)
+                return protonate(
+                    smi, ph_min=min_ph, ph_max=max_ph, precision=precision
+                )
             except TypeError:
-                return _p(smi, min_ph=min_ph, max_ph=max_ph)
+                try:
+                    return protonate(
+                        smi, min_ph=min_ph, max_ph=max_ph, precision=precision
+                    )
+                except TypeError:
+                    return protonate(smi, min_ph=min_ph, max_ph=max_ph)
 
-        return fn, _dimorphite_version()
+        return fn
+
+    try:
+        from dimorphite_dl.protonate import protonate_smiles as _p
+        return wrap_smiles_api(_p), _dimorphite_version()
     except ImportError:
         pass
 
     try:
         import dimorphite_dl
+
+        top_level_api = getattr(dimorphite_dl, "protonate_smiles", None)
+        if callable(top_level_api):
+            return wrap_smiles_api(top_level_api), _dimorphite_version()
 
         def fn(smi, min_ph, max_ph, precision):
             mol = Chem.MolFromSmiles(smi)
@@ -182,7 +204,7 @@ def _strip_cxsmiles_ext(token):
     return token
 
 
-def load_supplier_file(filepath, supplier_name=None):
+def load_supplier_file(filepath, supplier_name=None, expected_provenance=None):
     """Load a supplier SMILES/cxsmiles file into a DataFrame."""
 
     
@@ -190,8 +212,13 @@ def load_supplier_file(filepath, supplier_name=None):
         supplier_name = Path(filepath).stem
 
     records = []
-    with open(filepath, "r") as f:
-        for line_num, line in enumerate(f):
+    with open(filepath, "rb") as f:
+        stat_before = os.fstat(f.fileno())
+        digest = hashlib.sha256() if expected_provenance and "sha256" in expected_provenance else None
+        for line_num, raw_line in enumerate(f):
+            if digest is not None:
+                digest.update(raw_line)
+            line = raw_line.decode()
             line = line.rstrip("\n").strip()
             if not line:
                 continue
@@ -217,17 +244,36 @@ def load_supplier_file(filepath, supplier_name=None):
                 "original_supplier_smiles": smiles,
                 "supplier": supplier_name,
             })
+        stat_after = os.fstat(f.fileno())
+
+    if expected_provenance is not None:
+        _verify_observed_input(
+            filepath,
+            expected_provenance,
+            stat_before,
+            stat_after,
+            digest.hexdigest() if digest is not None else None,
+        )
 
     df = pd.DataFrame(records)
     print(f"  Loaded {len(df):,} molecules from {supplier_name}")
     return df
 
 
-def merge_suppliers(supplier_files):
+def merge_suppliers(supplier_files, input_provenance=None):
     print("\n" + "=" * 60)
     print("STEP 1: LOAD AND MERGE SUPPLIER CATALOGUES")
     print("=" * 60)
-    frames = [load_supplier_file(f, Path(f).stem) for f in supplier_files]
+    if input_provenance is not None and len(input_provenance) != len(supplier_files):
+        raise ValueError("Input provenance must match supplier files by position")
+    frames = [
+        load_supplier_file(
+            f,
+            Path(f).stem,
+            input_provenance[index] if input_provenance is not None else None,
+        )
+        for index, f in enumerate(supplier_files)
+    ]
     merged = pd.concat(frames, ignore_index=True)
     print(f"\n  Total molecules after merge: {merged.shape[0]:,}")
     return merged
@@ -277,7 +323,21 @@ def strip_salts(df):
 
 # Step 3: filters
 
-def apply_filters(df, pains_backend="auto", custom_smarts=None):
+
+def resolve_pains_backend(pains_backend):
+    if pains_backend == "auto":
+        return "gpu" if _NVMOLKIT_AVAILABLE else "cpu"
+    if pains_backend == "gpu" and not _NVMOLKIT_AVAILABLE:
+        return "cpu"
+    return pains_backend
+
+
+def apply_filters(
+    df,
+    pains_backend="auto",
+    custom_smarts=None,
+    custom_smarts_provenance=None,
+):
     """Complexity, BRENK, Lipinski, rings, aggregator, PAINS, optional custom SMARTS.
 
     PAINS is batched on GPU when nvMolKit is available; BRENK stays on CPU
@@ -287,14 +347,10 @@ def apply_filters(df, pains_backend="auto", custom_smarts=None):
     print("STEP 3: COMPOUND FILTERING")
     print("=" * 60)
 
-    if pains_backend == "auto":
-        backend = "gpu" if _NVMOLKIT_AVAILABLE else "cpu"
-    else:
-        backend = pains_backend
-    if backend == "gpu" and not _NVMOLKIT_AVAILABLE:
+    backend = resolve_pains_backend(pains_backend)
+    if pains_backend == "gpu" and backend == "cpu":
         print("  WARNING: --pains-backend gpu requested but nvMolKit not importable. "
               "Falling back to CPU.")
-        backend = "cpu"
     print(f"  PAINS backend: {backend}")
 
     brenk_params = FilterCatalogParams()
@@ -313,7 +369,9 @@ def apply_filters(df, pains_backend="auto", custom_smarts=None):
 
     custom_queries = []
     if custom_smarts:
-        custom_queries = load_custom_smarts(custom_smarts)
+        custom_queries = load_custom_smarts(
+            custom_smarts, expected_provenance=custom_smarts_provenance
+        )
         print(f"  Custom SMARTS patterns: {len(custom_queries)}")
 
     
@@ -432,13 +490,18 @@ def apply_filters(df, pains_backend="auto", custom_smarts=None):
     return pass_df, fail_df
 
 
-def load_custom_smarts(path):
+def load_custom_smarts(path, expected_provenance=None):
     """Load user-supplied SMARTS rejection patterns."""
 
     
     queries = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
+    with open(path, "rb") as f:
+        stat_before = os.fstat(f.fileno())
+        digest = hashlib.sha256() if expected_provenance and "sha256" in expected_provenance else None
+        for lineno, raw_line in enumerate(f, 1):
+            if digest is not None:
+                digest.update(raw_line)
+            line = raw_line.decode()
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -449,6 +512,16 @@ def load_custom_smarts(path):
             if q is None:
                 raise ValueError(f"{path}:{lineno}: unparseable SMARTS: {smarts!r}")
             queries.append((name, q))
+        stat_after = os.fstat(f.fileno())
+
+    if expected_provenance is not None:
+        _verify_observed_input(
+            path,
+            expected_provenance,
+            stat_before,
+            stat_after,
+            digest.hexdigest() if digest is not None else None,
+        )
     return queries
 
 
@@ -456,12 +529,24 @@ def load_custom_smarts(path):
 # Step 4: stereo
 
 
-def count_unspecified_stereocentres(mol):
+def unspecified_stereo_elements(mol):
+    """Return every unassigned stereo element RDKit can enumerate.
+
+    ``FindMolChiralCenters`` only sees tetrahedral atoms, so using it as the
+    enumeration gate silently leaves E/Z-only molecules unspecified.
+    ``FindPotentialStereo`` covers both atom and bond stereochemistry.
+    """
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-    stereo_info = Chem.FindMolChiralCenters(
-        mol, includeUnassigned=True, useLegacyImplementation=False
-    )
-    return sum(1 for _, label in stereo_info if label == "?")
+    return [
+        info
+        for info in Chem.FindPotentialStereo(mol)
+        if info.specified == Chem.StereoSpecified.Unspecified
+    ]
+
+
+def count_unspecified_stereocentres(mol):
+    """Backward-compatible name for the total unassigned stereo-element count."""
+    return len(unspecified_stereo_elements(mol))
 
 
 def filter_and_enumerate_stereo(df, max_unspecified=2):
@@ -471,14 +556,12 @@ def filter_and_enumerate_stereo(df, max_unspecified=2):
 
     filtered_out = 0
     records = []
-    opts = StereoEnumerationOptions(tryEmbedding=False, onlyUnassigned=True, maxIsomers=16)
-
     for _, row in df.iterrows():
         mol = Chem.MolFromSmiles(row["SMILES"])
         if mol is None:
             continue
 
-        n_unspec = count_unspecified_stereocentres(mol)
+        n_unspec = len(unspecified_stereo_elements(mol))
         if n_unspec > max_unspecified:
             filtered_out += 1
             continue
@@ -486,6 +569,12 @@ def filter_and_enumerate_stereo(df, max_unspecified=2):
         if n_unspec == 0:
             records.append(row.to_dict())
         else:
+            opts = StereoEnumerationOptions(
+                tryEmbedding=False,
+                onlyUnassigned=True,
+                maxIsomers=1 << n_unspec,
+                unique=True,
+            )
             for iso_idx, iso_mol in enumerate(EnumerateStereoisomers(mol, options=opts)):
                 rec = row.to_dict()
                 rec["SMILES"] = Chem.MolToSmiles(iso_mol, isomericSmiles=True)
@@ -493,7 +582,7 @@ def filter_and_enumerate_stereo(df, max_unspecified=2):
                 records.append(rec)
 
     result = pd.DataFrame(records)
-    print(f"  Removed (>{max_unspecified} unspecified centres): {filtered_out:,}")
+    print(f"  Removed (>{max_unspecified} unspecified stereo elements): {filtered_out:,}")
     print(f"  Molecules after enumeration: {len(result):,}")
     return result
 
@@ -631,7 +720,11 @@ def ionise_molecules(df, ph_min=7.4, ph_max=7.4, precision=None):
                 rec = row.to_dict()
                 rec["SMILES"] = v_smi
                 if len(variants) > 1:
-                    rec["ID"] = f"{row['ID']}_pH{v_idx + 1}"
+                    rec["ID"] = ";".join(
+                        f"{source_id}_pH{v_idx + 1}"
+                        for source_id in str(row["ID"]).split(";")
+                        if source_id
+                    )
                 records.append(rec)
         except Exception:
             records.append(row.to_dict())
@@ -647,18 +740,33 @@ def ionise_molecules(df, ph_min=7.4, ph_max=7.4, precision=None):
 
 
 def canonical_redup(df):
-    """Canonicalise and drop exact duplicates (used after ionisation)."""
+    """Canonicalise and merge exact duplicates after ionisation.
+
+    Keep every supplier and source ID. Dropping the later duplicate here loses
+    provenance when two ionisation paths converge on the same structure.
+    """
     before = len(df)
     df = df.copy()
     df["canonical"] = df["SMILES"].apply(
         lambda s: Chem.MolToSmiles(Chem.MolFromSmiles(s), isomericSmiles=True)
         if Chem.MolFromSmiles(s) is not None else None
     )
-    df = df.dropna(subset=["canonical"]).drop_duplicates(subset=["canonical"])
-    df["SMILES"] = df["canonical"]
-    df = df.drop(columns=["canonical"])
-    print(f"  Re-dedup: {before:,} -> {len(df):,}")
-    return df
+    df = df.dropna(subset=["canonical"])
+
+    def merge_values(values):
+        parts = set()
+        for value in values.dropna().astype(str):
+            parts.update(part for part in value.split(";") if part)
+        return ";".join(sorted(parts))
+
+    grouped = df.groupby("canonical", as_index=False).agg({
+        "ID": merge_values,
+        "original_supplier_smiles": merge_values,
+        "supplier": merge_values,
+    })
+    grouped = grouped.rename(columns={"canonical": "SMILES"})
+    print(f"  Re-dedup: {before:,} -> {len(grouped):,}")
+    return grouped
 
 
 
@@ -683,17 +791,15 @@ def _import_nvmolkit():
     return EmbedMolecules, MMFFOptimizeMoleculesConfs, HardwareOptions
 
 
-def gpu_smoke_test():
+def gpu_smoke_test(random_seed=DEFAULT_RANDOM_SEED):
     """Embed one trivial molecule and verify real 3D coordinates come back."""
-
-    
-    
     EmbedMolecules, MMFFOptimizeMoleculesConfs, HardwareOptions = _import_nvmolkit()
     from rdkit.Chem.rdDistGeom import ETKDGv3
 
     mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
     params = ETKDGv3()
     params.useRandomCoords = True
+    params.randomSeed = random_seed
     hw = HardwareOptions(preprocessingThreads=1, batchSize=1, batchesPerGpu=1, gpuIds=[])
 
     EmbedMolecules([mol], params, confsPerMolecule=1, hardwareOptions=hw)
@@ -710,14 +816,34 @@ def gpu_smoke_test():
     if not pos.any():
         raise RuntimeError("GPU smoke test FAILED: conformer returned all-zero coordinates.")
 
-    MMFFOptimizeMoleculesConfs([mol], maxIters=50, hardwareOptions=hw)
+    properties = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+    if properties is None:
+        raise RuntimeError("GPU smoke test FAILED: ethanol has no MMFF94s parameters.")
+    energies = MMFFOptimizeMoleculesConfs(
+        [mol], maxIters=50, properties=[properties], hardwareOptions=hw
+    )
+    if (
+        len(energies) != 1
+        or len(energies[0]) != mol.GetNumConformers()
+        or any(not math.isfinite(float(energy)) for energy in energies[0])
+    ):
+        raise RuntimeError("GPU smoke test FAILED: invalid MMFF94s energy output.")
     print("  GPU smoke test passed (ethanol embedded + minimised).")
 
 
-def _iter_smiles_file(path):
-    """Yield (smiles, mol_id) from the tab-delimited final SMILES file."""
-    with open(path) as f:
-        for line_num, line in enumerate(f):
+def _iter_smiles_file(path, expected_provenance=None):
+    """Yield final SMILES while verifying the exact captured input stream."""
+    with open(path, "rb") as f:
+        stat_before = os.fstat(f.fileno())
+        digest = (
+            hashlib.sha256()
+            if expected_provenance and "sha256" in expected_provenance
+            else None
+        )
+        for line_num, raw_line in enumerate(f):
+            if digest is not None:
+                digest.update(raw_line)
+            line = raw_line.decode()
             line = line.strip()
             if not line:
                 continue
@@ -727,67 +853,477 @@ def _iter_smiles_file(path):
             if smiles.upper() in ("SMILES", "CANONICAL_SMILES", "SMI", "SMILE"):
                 continue
             yield smiles, mol_id
+        stat_after = os.fstat(f.fileno())
+
+    if expected_provenance is not None:
+        _verify_observed_input(
+            path,
+            expected_provenance,
+            stat_before,
+            stat_after,
+            digest.hexdigest() if digest is not None else None,
+        )
 
 
 def _load_chunk(rows):
     mols = []
-    parse_fail = 0
+    failures = []
     for smiles, mol_id in rows:
         m = Chem.MolFromSmiles(smiles)
         if m is None:
-            parse_fail += 1
+            failures.append({
+                "ID": str(mol_id),
+                "reason": "parse_failed",
+                "requested": 0,
+                "generated": 0,
+                "retry_attempted": False,
+            })
             continue
         m = Chem.AddHs(m)
         m.SetProp("_Name", str(mol_id))
         mols.append(m)
-    return mols, parse_fail
+    return mols, failures
 
 
-def _embed_and_write(mols, writer, n_conformers, mmff_max_iters, hw):
-    EmbedMolecules, MMFFOptimizeMoleculesConfs, _ = _import_nvmolkit()
+def _embed_once(mols, n_conformers, hw, random_seed):
+    """Embed a molecule batch in-place with a deterministic ETKDG seed."""
+    if not mols:
+        return
+    EmbedMolecules, _, _ = _import_nvmolkit()
     from rdkit.Chem.rdDistGeom import ETKDGv3
 
     params = ETKDGv3()
     params.useRandomCoords = True  # required by nvMolKit
-
+    params.randomSeed = random_seed
     EmbedMolecules(mols, params, confsPerMolecule=n_conformers, hardwareOptions=hw)
 
-   
-    mmff_ok, mmff_bad = [], []
-    for m in mols:
-        if AllChem.MMFFGetMoleculeProperties(m, mmffVariant="MMFF94s") is None:
-            mmff_bad.append(m)
-        else:
-            mmff_ok.append(m)
 
-    energies = MMFFOptimizeMoleculesConfs(mmff_ok, maxIters=mmff_max_iters,
-                                          hardwareOptions=hw) if mmff_ok else []
+def _conformer_shortfalls(mols, n_conformers, retry_attempted):
+    failures = []
+    for mol in mols:
+        generated = mol.GetNumConformers()
+        if generated < n_conformers:
+            failures.append({
+                "ID": mol.GetProp("_Name") if mol.HasProp("_Name") else "",
+                "reason": "conformer_shortfall",
+                "requested": n_conformers,
+                "generated": generated,
+                "retry_attempted": retry_attempted,
+            })
+    return failures
+
+
+def _embedding_exception_failures(
+    mols, n_conformers, exc, *, stage, retry_attempted
+):
+    reason = f"{stage}_error:{type(exc).__name__}:{exc}"
+    return [
+        {
+            "ID": mol.GetProp("_Name") if mol.HasProp("_Name") else "",
+            "reason": reason,
+            "requested": n_conformers,
+            "generated": mol.GetNumConformers(),
+            "retry_attempted": retry_attempted,
+        }
+        for mol in mols
+    ]
+
+
+def _embed_and_write(
+    mols,
+    writer,
+    n_conformers,
+    mmff_max_iters,
+    hw,
+    retry_hw=None,
+    random_seed=DEFAULT_RANDOM_SEED,
+    allow_partial_conformers=False,
+    conformer_failure_records=None,
+    mmff_failure_records=None,
+):
+    """Embed, retry shortfalls once, MMFF94s-minimise, and write a batch."""
+    _, MMFFOptimizeMoleculesConfs, _ = _import_nvmolkit()
+    try:
+        _embed_once(mols, n_conformers, hw, random_seed)
+    except Exception as exc:
+        error_failures = _embedding_exception_failures(
+            mols,
+            n_conformers,
+            exc,
+            stage="primary_embedding",
+            retry_attempted=False,
+        )
+        if conformer_failure_records is not None:
+            conformer_failure_records.extend(error_failures)
+        raise RuntimeError(
+            "nvMolKit primary embedding failed; no conformers from this batch were accepted"
+        ) from exc
+
+    primary_counts = [mol.GetNumConformers() for mol in mols]
+    retry_indices = [
+        index for index, count in enumerate(primary_counts) if count < n_conformers
+    ]
+    if retry_indices and retry_hw is not None:
+        retry_mols = []
+        for index in retry_indices:
+            retry_mol = Chem.Mol(mols[index])
+            retry_mol.RemoveAllConformers()
+            retry_mols.append(retry_mol)
+        try:
+            _embed_once(
+                retry_mols,
+                n_conformers,
+                retry_hw,
+                (random_seed + 1) % (2**31 - 1),
+            )
+        except Exception as exc:
+            error_failures = _embedding_exception_failures(
+                retry_mols,
+                n_conformers,
+                exc,
+                stage="retry_embedding",
+                retry_attempted=True,
+            )
+            for failure, index in zip(error_failures, retry_indices):
+                failure["generated"] = max(
+                    failure["generated"], primary_counts[index]
+                )
+            if conformer_failure_records is not None:
+                conformer_failure_records.extend(error_failures)
+            raise RuntimeError(
+                "nvMolKit conservative embedding retry failed; no conformers from "
+                "this batch were accepted"
+            ) from exc
+        for index, retry_mol in zip(retry_indices, retry_mols):
+            if retry_mol.GetNumConformers() > primary_counts[index]:
+                mols[index] = retry_mol
+
+    failures = _conformer_shortfalls(
+        mols, n_conformers, retry_attempted=bool(retry_indices and retry_hw is not None)
+    )
+    if conformer_failure_records is not None:
+        conformer_failure_records.extend(failures)
+    incomplete_molecules = {
+        id(mol) for mol in mols if mol.GetNumConformers() < n_conformers
+    }
+    if allow_partial_conformers:
+        write_mols = [mol for mol in mols if mol.GetNumConformers() > 0]
+    else:
+        write_mols = [
+            mol
+            for mol in mols
+            if id(mol) not in incomplete_molecules
+        ]
+
+    mmff_ok, mmff_properties, mmff_bad = [], [], []
+    for mol in write_mols:
+        properties = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+        if properties is None:
+            mmff_bad.append(mol)
+        else:
+            mmff_ok.append(mol)
+            mmff_properties.append(properties)
+
+    mmff_skipped_ids = [
+        mol.GetProp("_Name") if mol.HasProp("_Name") else "" for mol in mmff_bad
+    ]
+    if mmff_failure_records is not None:
+        mmff_failure_records.extend(
+            {"ID": mol_id, "reason": "mmff94s_unparametrizable"}
+            for mol_id in mmff_skipped_ids
+        )
+
+    energies = (
+        MMFFOptimizeMoleculesConfs(
+            mmff_ok,
+            maxIters=mmff_max_iters,
+            properties=mmff_properties,
+            hardwareOptions=hw,
+        )
+        if mmff_ok
+        else []
+    )
+    if len(energies) != len(mmff_ok):
+        raise RuntimeError(
+            "nvMolKit MMFF94s returned energy results for "
+            f"{len(energies)} of {len(mmff_ok)} molecules"
+        )
 
     n_written = 0
-    for m, mol_energies in zip(mmff_ok, energies):
-        m.SetProp("MMFF_Minimised", "True")
-        for cid in range(m.GetNumConformers()):
-            if cid < len(mol_energies):
-                m.SetProp("MMFF_Energy", f"{mol_energies[cid]:.3f}")
-            elif m.HasProp("MMFF_Energy"):
-                m.ClearProp("MMFF_Energy")  # never carry a stale energy forward
-            writer.write(m, confId=cid)
+    for mol, mol_energies in zip(mmff_ok, energies):
+        conformers_to_write = min(mol.GetNumConformers(), n_conformers)
+        if len(mol_energies) != mol.GetNumConformers():
+            raise RuntimeError(
+                "nvMolKit MMFF94s returned a different number of energies than conformers for "
+                f"{mol.GetProp('_Name') if mol.HasProp('_Name') else '<unnamed>'}"
+            )
+        if any(not math.isfinite(float(energy)) for energy in mol_energies):
+            raise RuntimeError(
+                "nvMolKit MMFF94s returned a non-finite energy for "
+                f"{mol.GetProp('_Name') if mol.HasProp('_Name') else '<unnamed>'}"
+            )
+        mol.SetProp("MMFF_Minimised", "True")
+        for energy_index, conformer in enumerate(
+            list(mol.GetConformers())[:conformers_to_write]
+        ):
+            mol.SetProp("MMFF_Energy", f"{mol_energies[energy_index]:.3f}")
+            writer.write(mol, confId=conformer.GetId())
             n_written += 1
 
-    for m in mmff_bad:
-        m.SetProp("MMFF_Minimised", "False")
-        for cid in range(m.GetNumConformers()):
-            writer.write(m, confId=cid)
+    for mol in mmff_bad:
+        mol.SetProp("MMFF_Minimised", "False")
+        for conformer in list(mol.GetConformers())[:n_conformers]:
+            writer.write(mol, confId=conformer.GetId())
             n_written += 1
 
-    return n_written, len(mmff_bad)
+    conformer_shortfall = sum(
+        failure["requested"] - failure["generated"] for failure in failures
+    )
+    unwritten_conformers = len(mols) * n_conformers - n_written
+    return {
+        "confs": n_written,
+        "successful_mols": len(mols) - len(failures),
+        "failed_mols": len(failures),
+        "conformer_shortfall": conformer_shortfall,
+        "unwritten_conformers": unwritten_conformers,
+        "policy_dropped_conformers": max(
+            0, unwritten_conformers - conformer_shortfall
+        ),
+        "retried_mols": len(retry_indices),
+        "failures": failures,
+        "mmff_skipped": len(mmff_bad),
+        "mmff_skipped_ids": mmff_skipped_ids,
+    }
+
+
+class _CsvRecordSink:
+    """Stream report rows to disk while retaining only bounded examples."""
+
+    def __init__(self, path, fieldnames, example_limit=0):
+        self.path = str(path)
+        self.handle = open(path, "w", newline="")
+        self.writer = csv.DictWriter(self.handle, fieldnames=fieldnames)
+        self.writer.writeheader()
+        self.count = 0
+        self.example_limit = example_limit
+        self.examples = []
+
+    def append(self, record):
+        self.writer.writerow(record)
+        self.count += 1
+        if len(self.examples) < self.example_limit:
+            self.examples.append(dict(record))
+
+    def extend(self, records):
+        for record in records:
+            self.append(record)
+        self.handle.flush()
+
+    def close(self):
+        self.handle.close()
+
+
+def _paths_alias(left, right):
+    left = Path(left).expanduser().resolve()
+    right = Path(right).expanduser().resolve()
+    if left == right:
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _validate_regular_output_path(path, label):
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"Planned {label} must not be a symbolic link: {path}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"Planned {label} must be a regular file: {path}")
+
+
+def _create_staged_sdf(output_path):
+    """Create a unique, writable, same-directory SDF stage."""
+    output = Path(output_path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _ in range(100):
+        candidate = output.with_name(
+            f"{output.stem}.{secrets.token_hex(6)}.partial{output.suffix}"
+        )
+        try:
+            descriptor = os.open(candidate, flags, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            created_mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+            os.fchmod(descriptor, created_mode | stat.S_IWUSR)
+        except Exception:
+            os.close(descriptor)
+            candidate.unlink(missing_ok=True)
+            raise
+        else:
+            os.close(descriptor)
+        return candidate
+    raise RuntimeError(f"Could not allocate a unique staged SDF beside {output}")
+
+
+def _output_lock_path(output_path):
+    output = Path(output_path).expanduser().resolve()
+    return output.parent / ".libprep.pipeline.lock"
+
+
+class _OutputLock:
+    """Process-level lock preventing concurrent writers for one output path."""
+
+    def __init__(self, output_path):
+        output = Path(output_path).expanduser().resolve()
+        self.path = _output_lock_path(output)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.path, "a+")
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError(
+                f"Another pipeline process is already writing {output}"
+            ) from exc
+
+    def close(self):
+        if self.handle is None:
+            return
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _check_chunk_disk_space(output_sdf, rows_in_chunk, n_conformers, bytes_per_conformer):
+    if not bytes_per_conformer:
+        return
+    target = Path(output_sdf).resolve().parent
+    free = shutil.disk_usage(target).free
+    required = rows_in_chunk * n_conformers * bytes_per_conformer
+    if required > free * DISK_FREE_MARGIN:
+        raise RuntimeError(
+            f"Insufficient disk space for the next chunk. Estimated {required / 1024**3:.1f} GB "
+            f"needed, {free / 1024**3:.1f} GB free on {target}."
+        )
 
 
 def generate_conformers(smi_path, output_sdf, n_conformers=1, chunk_size=100_000,
                         mmff_max_iters=200, batch_size=500, batches_per_gpu=4,
-                        preprocessing_threads=8, gpu_ids=None):
+                        preprocessing_threads=8, gpu_ids=None,
+                        random_seed=DEFAULT_RANDOM_SEED,
+                        allow_partial_conformers=False,
+                        check_free_space=True,
+                        estimated_bytes_per_conformer=None,
+                        output_lock_held=False,
+                        before_commit=None,
+                        input_provenance=None):
+    """Lock an output target, then run bounded-memory GPU generation."""
+    positive_options = {
+        "n_conformers": n_conformers,
+        "chunk_size": chunk_size,
+        "mmff_max_iters": mmff_max_iters,
+    }
+    for name, value in positive_options.items():
+        if value < 1:
+            raise ValueError(f"{name} must be at least 1")
+    auto_options = {
+        "batch_size": batch_size,
+        "batches_per_gpu": batches_per_gpu,
+        "preprocessing_threads": preprocessing_threads,
+    }
+    for name, value in auto_options.items():
+        if value == 0 or value < -1:
+            raise ValueError(f"{name} must be -1 (automatic) or at least 1")
+    if not 0 <= random_seed < 2**31 - 1:
+        raise ValueError("random_seed must be between 0 and 2147483646")
+    if (
+        estimated_bytes_per_conformer is not None
+        and estimated_bytes_per_conformer <= 0
+    ):
+        raise ValueError("estimated_bytes_per_conformer must be positive")
+
+    smi_path = Path(smi_path).expanduser().resolve(strict=True)
+    output_path = Path(output_sdf)
+    stem = str(output_path.with_suffix(""))
+    planned_paths = {
+        "output SDF": output_path,
+        "conformer failure report": Path(f"{stem}_conformer_failures.csv"),
+        "MMFF94s report": Path(f"{stem}_mmff_unparametrizable.csv"),
+        "output lock": _output_lock_path(output_path),
+    }
+    checked_paths = []
+    for label, planned_path in planned_paths.items():
+        _validate_regular_output_path(planned_path, label)
+        if _paths_alias(smi_path, planned_path):
+            raise ValueError(
+                f"Conformer input aliases planned {label}: {Path(smi_path).resolve()}"
+            )
+        for other_label, other_path in checked_paths:
+            if _paths_alias(planned_path, other_path):
+                raise ValueError(
+                    f"Planned {label} aliases planned {other_label}: "
+                    f"{planned_path.resolve()}"
+                )
+        checked_paths.append((label, planned_path))
+    output_lock = None if output_lock_held else _OutputLock(output_sdf)
+    try:
+        if input_provenance is None:
+            input_provenance = capture_input_provenance(
+                [smi_path], hash_inputs=True
+            )[0]
+        return _generate_conformers_locked(
+            smi_path,
+            output_sdf,
+            n_conformers=n_conformers,
+            chunk_size=chunk_size,
+            mmff_max_iters=mmff_max_iters,
+            batch_size=batch_size,
+            batches_per_gpu=batches_per_gpu,
+            preprocessing_threads=preprocessing_threads,
+            gpu_ids=gpu_ids,
+            random_seed=random_seed,
+            allow_partial_conformers=allow_partial_conformers,
+            check_free_space=check_free_space,
+            estimated_bytes_per_conformer=estimated_bytes_per_conformer,
+            before_commit=before_commit,
+            input_provenance=input_provenance,
+        )
+    finally:
+        if output_lock is not None:
+            output_lock.close()
+
+
+def _generate_conformers_locked(
+    smi_path,
+    output_sdf,
+    n_conformers=1,
+    chunk_size=100_000,
+    mmff_max_iters=200,
+    batch_size=500,
+    batches_per_gpu=4,
+    preprocessing_threads=8,
+    gpu_ids=None,
+    random_seed=DEFAULT_RANDOM_SEED,
+    allow_partial_conformers=False,
+    check_free_space=True,
+    estimated_bytes_per_conformer=None,
+    before_commit=None,
+    input_provenance=None,
+):
     """GPU conformer generation, streamed from disk in bounded-memory chunks."""
-    
     print("\n" + "=" * 60)
     print("STEP 7: CONFORMER GENERATION (nvMolKit / GPU, chunked)")
     print("=" * 60)
@@ -801,66 +1337,226 @@ def generate_conformers(smi_path, output_sdf, n_conformers=1, chunk_size=100_000
         batchesPerGpu=batches_per_gpu,
         gpuIds=gpu_ids if gpu_ids else [],
     )
+    retry_hw = HardwareOptions(
+        preprocessingThreads=1,
+        batchSize=1,
+        batchesPerGpu=1,
+        gpuIds=gpu_ids if gpu_ids else [],
+    )
 
     print(f"  chunk-size: {chunk_size:,}  batch-size: {batch_size}  "
           f"batches/gpu: {batches_per_gpu}")
+    print(f"  random-seed: {random_seed}  force-field: MMFF94s")
+
+    output_path = Path(output_sdf)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    desired_output_mode = (
+        stat.S_IMODE(output_path.stat().st_mode) if output_path.is_file() else None
+    )
+    if check_free_space and estimated_bytes_per_conformer is None:
+        disk_estimate = check_disk_space(
+            output_path,
+            smi_path,
+            n_conformers,
+            input_provenance=input_provenance,
+        )
+        estimated_bytes_per_conformer = disk_estimate["bytes_per_conformer"]
 
     t_total = time.time()
-    totals = {"mols": 0, "confs": 0, "parse_fail": 0, "mmff_skipped": 0}
+    totals = {
+        "input_rows": 0,
+        "mols": 0,
+        "successful_mols": 0,
+        "failed_mols": 0,
+        "conformer_shortfall": 0,
+        "unwritten_conformers": 0,
+        "policy_dropped_conformers": 0,
+        "retried_mols": 0,
+        "confs": 0,
+        "parse_fail": 0,
+        "mmff_skipped": 0,
+    }
     chunk_idx = 0
-    writer = SDWriter(str(output_sdf))
+    stem = str(output_path.with_suffix(""))
+    failure_report = f"{stem}_conformer_failures.csv"
+    mmff_report = f"{stem}_mmff_unparametrizable.csv"
+    partial_output_path = _create_staged_sdf(output_path)
+    print(f"  staged SDF: {partial_output_path}")
+    failure_sink = _CsvRecordSink(
+        failure_report,
+        ["ID", "reason", "requested", "generated", "retry_attempted"],
+        example_limit=FAILURE_EXAMPLE_LIMIT,
+    )
+    try:
+        mmff_sink = _CsvRecordSink(mmff_report, ["ID", "reason"])
+    except Exception:
+        failure_sink.close()
+        raise
+    try:
+        writer = SDWriter(str(partial_output_path))
+    except Exception:
+        try:
+            failure_sink.close()
+        finally:
+            mmff_sink.close()
+        raise
 
     def _process(rows, final=False):
         nonlocal chunk_idx
         chunk_idx += 1
         t0 = time.time()
-        mols, parse_fail = _load_chunk(rows)
-        tag = " (final)" if final else ""
-        print(f"  Chunk {chunk_idx}{tag}: {len(mols):,} mols ({parse_fail} parse failures)")
-
-        if not mols:
-            totals["parse_fail"] += parse_fail
-            return
-
-        n_written, n_bad = _embed_and_write(mols, writer, n_conformers, mmff_max_iters, hw)
-
-        
-        
-        if n_written == 0:
-            raise RuntimeError(
-                f"Chunk {chunk_idx}: {len(mols):,} molecules in, 0 conformers out.\n"
-                "  This is the silent GPU failure mode, usually VRAM exhaustion.\n"
-                f"  Retry with a smaller --batch-size (currently {batch_size}) "
-                f"and/or --chunk-size (currently {chunk_size:,})."
+        mols, parse_failures = _load_chunk(rows)
+        for failure in parse_failures:
+            failure["requested"] = n_conformers
+        failure_sink.extend(parse_failures)
+        if check_free_space:
+            _check_chunk_disk_space(
+                output_path, len(mols), n_conformers, estimated_bytes_per_conformer
             )
+        tag = " (final)" if final else ""
+        print(
+            f"  Chunk {chunk_idx}{tag}: {len(mols):,} mols "
+            f"({len(parse_failures)} parse failures)"
+        )
 
+        result = {
+            "confs": 0,
+            "successful_mols": 0,
+            "failed_mols": 0,
+            "conformer_shortfall": 0,
+            "unwritten_conformers": 0,
+            "policy_dropped_conformers": 0,
+            "retried_mols": 0,
+            "failures": [],
+            "mmff_skipped": 0,
+            "mmff_skipped_ids": [],
+        }
+        if mols:
+            conformer_failure_count = failure_sink.count
+            mmff_failure_count = mmff_sink.count
+            result = _embed_and_write(
+                mols,
+                writer,
+                n_conformers,
+                mmff_max_iters,
+                hw,
+                retry_hw=retry_hw,
+                random_seed=(random_seed + chunk_idx - 1) % (2**31 - 1),
+                allow_partial_conformers=allow_partial_conformers,
+                conformer_failure_records=failure_sink,
+                mmff_failure_records=mmff_sink,
+            )
+            # Test doubles and older private callers may not consume the optional
+            # report sinks, so retain a compatibility fallback without duplicating
+            # records from the real implementation.
+            if failure_sink.count == conformer_failure_count:
+                failure_sink.extend(result["failures"])
+            if mmff_sink.count == mmff_failure_count:
+                mmff_sink.extend(
+                    {"ID": mol_id, "reason": "mmff94s_unparametrizable"}
+                    for mol_id in result["mmff_skipped_ids"]
+                )
+
+        chunk_failures = parse_failures + result["failures"]
+        totals["input_rows"] += len(rows)
         totals["mols"] += len(mols)
-        totals["confs"] += n_written
-        totals["parse_fail"] += parse_fail
-        totals["mmff_skipped"] += n_bad
+        totals["successful_mols"] += result["successful_mols"]
+        totals["failed_mols"] += len(parse_failures) + result["failed_mols"]
+        totals["conformer_shortfall"] += (
+            len(parse_failures) * n_conformers + result["conformer_shortfall"]
+        )
+        totals["unwritten_conformers"] += (
+            len(parse_failures) * n_conformers
+            + result.get("unwritten_conformers", result["conformer_shortfall"])
+        )
+        totals["policy_dropped_conformers"] += result.get(
+            "policy_dropped_conformers", 0
+        )
+        totals["retried_mols"] += result["retried_mols"]
+        totals["confs"] += result["confs"]
+        totals["parse_fail"] += len(parse_failures)
+        totals["mmff_skipped"] += result["mmff_skipped"]
 
         dt = time.time() - t0
-        print(f"    {n_written:,} confs in {dt:.0f}s ({n_written / max(dt, 1e-9):.0f} confs/s)")
+        print(
+            f"    {result['confs']:,} confs in {dt:.0f}s "
+            f"({result['confs'] / max(dt, 1e-9):.0f} confs/s)"
+        )
+
+        if chunk_failures and not allow_partial_conformers:
+            raise RuntimeError(
+                f"Chunk {chunk_idx} has {len(chunk_failures):,} molecule(s) without all "
+                f"{n_conformers} requested conformers after retry. Details: {failure_report}. "
+                "Use --allow-partial-conformers only if an incomplete library is acceptable."
+            )
 
         del mols
         gc.collect()
 
-    chunk = []
-    for smiles, mol_id in _iter_smiles_file(smi_path):
-        chunk.append((smiles, mol_id))
-        if len(chunk) >= chunk_size:
-            _process(chunk)
-            chunk = []
-    if chunk:
-        _process(chunk, final=True)
-
-    writer.close()
+    try:
+        chunk = []
+        for smiles, mol_id in _iter_smiles_file(
+            smi_path, expected_provenance=input_provenance
+        ):
+            chunk.append((smiles, mol_id))
+            if len(chunk) >= chunk_size:
+                _process(chunk)
+                chunk = []
+        if chunk:
+            _process(chunk, final=True)
+    finally:
+        try:
+            writer.close()
+        finally:
+            try:
+                failure_sink.close()
+            finally:
+                mmff_sink.close()
 
     dt = time.time() - t_total
-    print(f"\n  Molecules: {totals['mols']:,}")
+    if totals["input_rows"] == 0:
+        raise RuntimeError(
+            "Conformer input contained no molecule records; refusing to replace "
+            "the final SDF with an empty file"
+        )
+    requested_conformers = totals["input_rows"] * n_conformers
+    if totals["confs"] + totals["unwritten_conformers"] != requested_conformers:
+        raise RuntimeError(
+            "Internal conformer accounting error: written + unwritten does not "
+            "equal requested"
+        )
+    if (
+        totals["conformer_shortfall"] + totals["policy_dropped_conformers"]
+        != totals["unwritten_conformers"]
+    ):
+        raise RuntimeError(
+            "Internal conformer accounting error: shortfall + policy-dropped does "
+            "not equal unwritten"
+        )
+    if input_provenance is not None:
+        verify_input_provenance([input_provenance])
+    if before_commit is not None:
+        before_commit()
+    if desired_output_mode is not None:
+        partial_output_path.chmod(desired_output_mode)
+    os.replace(partial_output_path, output_path)
+    totals["failure_report"] = failure_report
+    totals["mmff_report"] = mmff_report
+    totals["failure_count"] = failure_sink.count
+    totals["failures"] = list(failure_sink.examples)
+    totals["failures_truncated"] = failure_sink.count > len(failure_sink.examples)
+    print(f"\n  Molecules attempted: {totals['input_rows']:,}")
+    print(f"  Molecules parsed: {totals['mols']:,}")
+    print(f"  Molecules complete: {totals['successful_mols']:,}")
+    print(f"  Molecules incomplete: {totals['failed_mols']:,}")
     print(f"  Conformers written: {totals['confs']:,}")
+    print(f"  Conformers unwritten: {totals['unwritten_conformers']:,}")
+    print(f"  Embedding shortfall: {totals['conformer_shortfall']:,}")
+    print(f"  Withheld by strict policy: {totals['policy_dropped_conformers']:,}")
     print(f"  Parse failures: {totals['parse_fail']:,}")
     print(f"  MMFF-unparametrisable (written unminimised): {totals['mmff_skipped']:,}")
+    print(f"  Conformer failure report: {failure_report}")
+    print(f"  MMFF94s report: {mmff_report}")
     print(f"  Total time: {dt:.0f}s ({dt / 3600:.2f}h)")
     if dt > 0:
         print(f"  Throughput: {totals['confs'] / dt:.0f} confs/s")
@@ -871,20 +1567,102 @@ def generate_conformers(smi_path, output_sdf, n_conformers=1, chunk_size=100_000
 # Pre-flight disk check + manifest
 
 
-def check_disk_space(output_path, n_molecules, n_conformers, margin=0.90):
-    """Refuse to start a run that will plausibly fill the volume.
+def _estimated_sdf_record_bytes(smiles, mol_id="sample"):
+    """Estimate one explicit-H conformer record including pipeline properties."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol = Chem.AddHs(mol)
+    mol.SetProp("_Name", str(mol_id))
+    block = Chem.MolToMolBlock(mol)
+    properties = (
+        "\n>  <MMFF_Minimised>\nTrue\n\n"
+        ">  <MMFF_Energy>\n-123.456\n\n$$$$\n"
+    )
+    return len((block + properties).encode("utf-8"))
 
-    Better to fail in one second than six hours in with a half-written SDF.
-    """
-    est_bytes = n_molecules * n_conformers * BYTES_PER_CONFORMER
+
+def estimate_sdf_bytes(
+    smi_path,
+    n_conformers,
+    sample_size=DISK_SAMPLE_SIZE,
+    safety_factor=DISK_SAFETY_FACTOR,
+    input_provenance=None,
+):
+    """Estimate total SDF size from a deterministic reservoir sample."""
+    if sample_size < 1:
+        raise ValueError("sample_size must be at least 1")
+    if safety_factor < 1:
+        raise ValueError("safety_factor must be at least 1")
+
+    rng = random.Random(DEFAULT_RANDOM_SEED)
+    sample = []
+    molecule_count = 0
+    for smiles, mol_id in _iter_smiles_file(
+        smi_path, expected_provenance=input_provenance
+    ):
+        record_bytes = _estimated_sdf_record_bytes(smiles, mol_id)
+        if record_bytes is None:
+            continue
+        molecule_count += 1
+        if len(sample) < sample_size:
+            sample.append(record_bytes)
+            continue
+        replacement = rng.randrange(molecule_count)
+        if replacement < sample_size:
+            sample[replacement] = record_bytes
+
+    if not sample:
+        return {
+            "molecule_count": 0,
+            "sample_count": 0,
+            "sampled_mean_bytes": 0,
+            "bytes_per_conformer": MIN_BYTES_PER_CONFORMER,
+            "estimated_total_bytes": 0,
+            "safety_factor": safety_factor,
+        }
+
+    sampled_mean = sum(sample) / len(sample)
+    bytes_per_conformer = max(
+        MIN_BYTES_PER_CONFORMER,
+        math.ceil(sampled_mean * safety_factor),
+    )
+    return {
+        "molecule_count": molecule_count,
+        "sample_count": len(sample),
+        "sampled_mean_bytes": math.ceil(sampled_mean),
+        "bytes_per_conformer": bytes_per_conformer,
+        "estimated_total_bytes": molecule_count * n_conformers * bytes_per_conformer,
+        "safety_factor": safety_factor,
+    }
+
+
+def check_disk_space(
+    output_path,
+    smi_path,
+    n_conformers,
+    margin=DISK_FREE_MARGIN,
+    sample_size=DISK_SAMPLE_SIZE,
+    input_provenance=None,
+):
+    """Refuse runs whose sampled, padded SDF estimate could fill the volume."""
+    estimate_kwargs = {"sample_size": sample_size}
+    if input_provenance is not None:
+        estimate_kwargs["input_provenance"] = input_provenance
+    estimate = estimate_sdf_bytes(smi_path, n_conformers, **estimate_kwargs)
+    est_bytes = estimate["estimated_total_bytes"]
     target = Path(output_path).resolve().parent
     free = shutil.disk_usage(target).free
 
     def gb(x):
         return x / 1024 ** 3
 
-    print(f"\n  Estimated output size: {gb(est_bytes):.1f} GB "
-          f"({n_molecules:,} mols x {n_conformers} confs)")
+    print(
+        f"\n  Estimated output size: {gb(est_bytes):.1f} GB "
+        f"({estimate['molecule_count']:,} mols x {n_conformers} confs; "
+        f"{estimate['sample_count']:,}-molecule sample, "
+        f"{estimate['safety_factor']:.0%} size factor)"
+    )
     print(f"  Free space on {target}: {gb(free):.1f} GB")
 
     if est_bytes > free * margin:
@@ -894,6 +1672,7 @@ def check_disk_space(output_path, n_molecules, n_conformers, margin=0.90):
             "  Reduce --n-conformers, split the input, write to a larger volume, "
             "or pass --skip-disk-check to override."
         )
+    return estimate
 
 
 def _sha256(path, block=1 << 20):
@@ -904,23 +1683,205 @@ def _sha256(path, block=1 << 20):
     return h.hexdigest()
 
 
-def write_manifest(path, args, params, counts, timings, hash_inputs=True):
-    """Emit a JSON sidecar: same input + same manifest => same library."""
+def _stat_fingerprint(stat_result):
+    return {
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "bytes": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+        "ctime_ns": stat_result.st_ctime_ns,
+    }
+
+
+def _raise_input_changed(path):
+    raise RuntimeError(
+        f"Input changed while the pipeline was reading it: {Path(path).resolve()}. "
+        "The run was not marked successful; rerun with an unchanged input file."
+    )
+
+
+def _verify_observed_input(
+    path,
+    expected_provenance,
+    stat_before,
+    stat_after,
+    observed_sha256=None,
+):
+    """Prove that bytes consumed from an input match the captured snapshot."""
+    before = _stat_fingerprint(stat_before)
+    after = _stat_fingerprint(stat_after)
+    try:
+        current = _stat_fingerprint(Path(path).stat())
+    except OSError:
+        _raise_input_changed(path)
+
+    if before != after or after != current:
+        _raise_input_changed(path)
+    for key in ("device", "inode", "bytes", "mtime_ns", "ctime_ns"):
+        if key in expected_provenance and after[key] != expected_provenance[key]:
+            _raise_input_changed(path)
+    expected_digest = expected_provenance.get("sha256")
+    if expected_digest is not None and observed_sha256 != expected_digest:
+        _raise_input_changed(path)
+
+
+def capture_input_provenance(paths, hash_inputs=True):
+    """Capture a stable source snapshot before long-running pipeline work."""
+    inputs = []
+    for path in paths:
+        source = Path(path).expanduser().resolve(strict=True)
+        digest = hashlib.sha256() if hash_inputs else None
+        with open(source, "rb") as handle:
+            stat_before = os.fstat(handle.fileno())
+            if digest is not None:
+                for block in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(block)
+            stat_after = os.fstat(handle.fileno())
+        fingerprint = _stat_fingerprint(stat_after)
+        if (
+            _stat_fingerprint(stat_before) != fingerprint
+            or _stat_fingerprint(source.stat()) != fingerprint
+        ):
+            _raise_input_changed(source)
+        entry = {
+            "path": str(source),
+            **fingerprint,
+        }
+        if hash_inputs:
+            entry["sha256"] = digest.hexdigest()
+        inputs.append(entry)
+    return inputs
+
+
+def verify_input_provenance(input_provenance):
+    """Refuse success if any captured input no longer matches its snapshot."""
+    for expected in input_provenance:
+        current = capture_input_provenance(
+            [expected["path"]], hash_inputs="sha256" in expected
+        )[0]
+        for key in ("device", "inode", "bytes", "mtime_ns", "ctime_ns", "sha256"):
+            if key in expected and current.get(key) != expected[key]:
+                _raise_input_changed(expected["path"])
+
+
+def _write_json_atomic(path, payload):
+    """Replace a JSON sidecar atomically so readers never see a torn file."""
+    destination = Path(path)
+    _validate_regular_output_path(destination, "JSON sidecar")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    desired_mode = (
+        stat.S_IMODE(destination.stat().st_mode) if destination.is_file() else None
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _ in range(100):
+        temporary = destination.with_name(
+            f".{destination.name}.{secrets.token_hex(6)}.tmp"
+        )
+        try:
+            descriptor = os.open(temporary, flags, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            if desired_mode is not None:
+                os.fchmod(descriptor, desired_mode)
+        except Exception:
+            os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+            raise
+        break
+    else:
+        raise RuntimeError(f"Could not allocate a temporary JSON file beside {destination}")
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_run_marker(path, args, params, input_provenance=None):
+    """Invalidate any previous success manifest before this run mutates outputs."""
+    inputs = input_provenance
+    if inputs is None:
+        inputs = []
+        for input_path in args.input:
+            source = Path(input_path)
+            entry = {"path": str(source.resolve()), "exists": source.is_file()}
+            if entry["exists"]:
+                stat_result = source.stat()
+                entry["bytes"] = stat_result.st_size
+                entry["mtime_ns"] = stat_result.st_mtime_ns
+            inputs.append(entry)
+    marker = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "pipeline_version": "2.1",
+        "status": "in_progress",
+        "preset": args.preset,
+        "inputs": inputs,
+        "planned_output_sdf": (
+            str(Path(args.output).resolve()) if not args.skip_conformers else None
+        ),
+        "output_sdf": None,
+        "parameters": {
+            **params,
+            "random_seed": args.random_seed,
+            "allow_partial_conformers": args.allow_partial_conformers,
+        },
+        "note": "Replaced by a status=succeeded manifest only after all outputs finish.",
+    }
+    _write_json_atomic(path, marker)
+
+
+def write_manifest(
+    path,
+    args,
+    params,
+    counts,
+    timings,
+    hash_inputs=True,
+    artifacts=None,
+    input_provenance=None,
+):
+    """Emit a JSON sidecar describing inputs, resolved parameters, and outputs."""
     import rdkit
 
-    inputs = []
-    for p in args.input:
-        entry = {"path": str(Path(p).resolve()), "bytes": os.path.getsize(p)}
-        if hash_inputs:
-            entry["sha256"] = _sha256(p)
-        inputs.append(entry)
+    if input_provenance is not None:
+        verify_input_provenance(input_provenance)
+    inputs = (
+        [dict(entry) for entry in input_provenance]
+        if input_provenance is not None
+        else capture_input_provenance(args.input, hash_inputs=hash_inputs)
+    )
+
+    artifact_entries = {}
+    for name, artifact_path in (artifacts or {}).items():
+        if artifact_path is None:
+            continue
+        artifact = Path(artifact_path)
+        entry = {"path": str(artifact.resolve()), "exists": artifact.is_file()}
+        if entry["exists"]:
+            entry["bytes"] = artifact.stat().st_size
+        artifact_entries[name] = entry
+
+    output_sdf = None
+    if not args.skip_conformers:
+        output_sdf = str(Path(args.output).resolve())
 
     manifest = {
         "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "pipeline_version": "2.0",
+        "pipeline_version": "2.1",
+        "status": "succeeded",
         "preset": args.preset,
         "inputs": inputs,
-        "output_sdf": str(Path(args.output).resolve()),
+        "output_sdf": output_sdf,
+        "artifacts": artifact_entries,
         "parameters": params,
         "stage_counts": counts,
         "timings_seconds": timings,
@@ -932,13 +1893,66 @@ def write_manifest(path, args, params, counts, timings, hash_inputs=True):
             "pandas": pd.__version__,
         },
     }
-    with open(path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    _write_json_atomic(path, manifest)
     print(f"  Manifest: {path}")
 
 
 
 # CLI
+
+
+def _validate_pipeline_paths(args, params):
+    """Reject any planned output that aliases an input or another output."""
+    out_path = Path(args.output)
+    stem = str(out_path.with_suffix(""))
+    protected = {
+        f"input[{index}]": Path(path).expanduser().resolve()
+        for index, path in enumerate(args.input)
+    }
+    if args.custom_smarts:
+        protected["custom SMARTS"] = Path(args.custom_smarts).expanduser().resolve()
+
+    planned = {
+        "final SMILES": Path(f"{stem}_final.smi"),
+        "final metadata": Path(f"{stem}_final_metadata.csv"),
+        "manifest": Path(f"{stem}_manifest.json"),
+        "output lock": _output_lock_path(out_path),
+    }
+    if not args.skip_conformers:
+        planned.update({
+            "output SDF": out_path,
+            "conformer failure report": Path(f"{stem}_conformer_failures.csv"),
+            "MMFF94s report": Path(f"{stem}_mmff_unparametrizable.csv"),
+        })
+    if args.save_intermediates:
+        planned.update({
+            "merged intermediate": Path(f"{stem}_01_merged.csv"),
+            "salt intermediate": Path(f"{stem}_02_salts_stripped.csv"),
+            "filtered intermediate": Path(f"{stem}_03_filtered.csv"),
+            "filter rejects": Path(f"{stem}_03_failed.csv"),
+            "stereo intermediate": Path(f"{stem}_04_stereo.csv"),
+            "deduplicated intermediate": Path(f"{stem}_05_deduplicated.csv"),
+        })
+        if params["tautomers"]:
+            planned["tautomer intermediate"] = Path(f"{stem}_04b_tautomers.csv")
+        if params["ionise"]:
+            planned["ionisation intermediate"] = Path(f"{stem}_06_ionised.csv")
+
+    resolved_outputs = {}
+    for label, path in planned.items():
+        _validate_regular_output_path(path, label)
+        resolved = path.expanduser().resolve()
+        for protected_label, protected_path in protected.items():
+            if _paths_alias(resolved, protected_path):
+                raise ValueError(
+                    f"Planned {label} path aliases {protected_label}: {resolved}"
+                )
+        for other_path, other_label in resolved_outputs.items():
+            if _paths_alias(resolved, other_path):
+                raise ValueError(
+                    f"Planned {label} path aliases {other_label}: {resolved}"
+                )
+        resolved_outputs[resolved] = label
 
 
 def build_parser():
@@ -962,7 +1976,7 @@ def build_parser():
     # Sentinels: None means "take it from the preset".
     p.add_argument("--n-conformers", type=int, default=None, help="Conformers per molecule")
     p.add_argument("--max-unspecified-stereo", type=int, default=None,
-                   help="Max unspecified stereocentres before rejection")
+                   help="Max unspecified atom/bond stereo elements before rejection")
     p.add_argument("--max-tautomers", type=int, default=None, help="Max tautomers per molecule")
     p.add_argument("--ph", type=float, default=None,
                    help="Single ionisation pH (sets ph-min = ph-max, one state per molecule)")
@@ -987,10 +2001,23 @@ def build_parser():
     p.add_argument("--chunk-size", type=int, default=100_000,
                    help="Molecules held in RAM per conformer chunk (default: 100000)")
     p.add_argument("--batch-size", type=int, default=500,
-                   help="nvMolKit GPU batch size (default: 500; lower for <16GB VRAM)")
-    p.add_argument("--batches-per-gpu", type=int, default=4, help="nvMolKit batches per GPU")
-    p.add_argument("--preprocessing-threads", type=int, default=8, help="CPU preprocessing threads")
+                   help="nvMolKit GPU batch size (default: 500; -1 lets nvMolKit choose)")
+    p.add_argument("--batches-per-gpu", type=int, default=4,
+                   help="nvMolKit batches per GPU (default: 4; -1 automatic)")
+    p.add_argument("--preprocessing-threads", type=int, default=8,
+                   help="CPU preprocessing threads (default: 8; -1 automatic)")
     p.add_argument("--mmff-max-iters", type=int, default=200, help="MMFF94s max iterations")
+    p.add_argument(
+        "--random-seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        help=f"Deterministic ETKDG seed (default: {DEFAULT_RANDOM_SEED})",
+    )
+    p.add_argument(
+        "--allow-partial-conformers",
+        action="store_true",
+        help="Succeed with a failure report when some molecules remain incomplete after retry",
+    )
 
     p.add_argument("--skip-disk-check", action="store_true", help="Bypass the pre-flight disk check")
     p.add_argument("--skip-smoke-test", action="store_true", help="Bypass the GPU smoke test")
@@ -1024,17 +2051,72 @@ def resolve_params(args):
 
     if params["ph_min"] > params["ph_max"]:
         raise ValueError("--ph-min must be <= --ph-max")
+    if not 0 <= params["ph_min"] <= params["ph_max"] <= 14:
+        raise ValueError("pH values must be between 0 and 14")
+    if params["n_conformers"] < 1:
+        raise ValueError("--n-conformers must be at least 1")
+    if not 0 <= params["max_unspecified_stereo"] <= 4:
+        raise ValueError("--max-unspecified-stereo must be between 0 and 4")
+    if params["max_tautomers"] < 1:
+        raise ValueError("--max-tautomers must be at least 1")
+    positive_runtime_args = {
+        "--chunk-size": args.chunk_size,
+        "--mmff-max-iters": args.mmff_max_iters,
+    }
+    for flag, value in positive_runtime_args.items():
+        if value < 1:
+            raise ValueError(f"{flag} must be at least 1")
+    auto_tunable_runtime_args = {
+        "--batch-size": args.batch_size,
+        "--batches-per-gpu": args.batches_per_gpu,
+        "--preprocessing-threads": args.preprocessing_threads,
+    }
+    for flag, value in auto_tunable_runtime_args.items():
+        if value == 0 or value < -1:
+            raise ValueError(f"{flag} must be -1 (automatic) or at least 1")
+    if not 0 <= args.random_seed < 2**31 - 1:
+        raise ValueError("--random-seed must be between 0 and 2147483646")
 
     return params
 
 
-def main():
-    args = build_parser().parse_args()
-    params = resolve_params(args)
+def _with_pipeline_output_lock(entrypoint):
+    def locked_entrypoint():
+        args = build_parser().parse_args()
+        params = resolve_params(args)
+        _validate_pipeline_paths(args, params)
+        out_path = Path(args.output)
+        output_lock = _OutputLock(out_path)
+        try:
+            return entrypoint(args, params, out_path)
+        finally:
+            output_lock.close()
 
-    out_path = Path(args.output)
+    return locked_entrypoint
+
+
+@_with_pipeline_output_lock
+def main(args, params, out_path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stem = str(out_path.with_suffix(""))
+    manifest_path = f"{stem}_manifest.json"
+    supplier_provenance = capture_input_provenance(
+        args.input, hash_inputs=not args.no_hash_inputs
+    )
+    for entry in supplier_provenance:
+        entry["role"] = "molecule_input"
+    custom_smarts_provenance = None
+    if args.custom_smarts:
+        custom_smarts_provenance = capture_input_provenance(
+            [args.custom_smarts], hash_inputs=not args.no_hash_inputs
+        )[0]
+        custom_smarts_provenance["role"] = "custom_smarts"
+    input_provenance = list(supplier_provenance)
+    if custom_smarts_provenance is not None:
+        input_provenance.append(custom_smarts_provenance)
+    write_run_marker(
+        manifest_path, args, params, input_provenance=input_provenance
+    )
 
     t_total = time.time()
     timings = {}
@@ -1051,7 +2133,7 @@ def main():
     # Fail fast on a dead GPU rather than after the CPU stages.
     if not args.skip_conformers and not args.skip_smoke_test:
         print("\n  Running GPU smoke test...")
-        gpu_smoke_test()
+        gpu_smoke_test(random_seed=args.random_seed)
 
     def stage(name, fn, *a, **kw):
         t0 = time.time()
@@ -1059,8 +2141,13 @@ def main():
         timings[name] = round(time.time() - t0, 1)
         return result
 
-    df = stage("merge", merge_suppliers, args.input)
+    df = stage(
+        "merge", merge_suppliers, args.input, supplier_provenance
+    )
     counts["merged"] = len(df)
+    if df.empty:
+        print("\nNo molecules were found in the input files. Nothing to do.")
+        sys.exit(1)
     if args.save_intermediates:
         df.to_csv(f"{stem}_01_merged.csv", index=False)
 
@@ -1071,7 +2158,8 @@ def main():
 
     df, failed_df = stage("filters", apply_filters, df,
                           pains_backend=args.pains_backend,
-                          custom_smarts=args.custom_smarts)
+                          custom_smarts=args.custom_smarts,
+                          custom_smarts_provenance=custom_smarts_provenance)
     counts["after_filters"] = len(df)
     counts["filter_rejects"] = len(failed_df)
     if args.save_intermediates:
@@ -1085,6 +2173,9 @@ def main():
     df = stage("stereo", filter_and_enumerate_stereo, df,
                max_unspecified=params["max_unspecified_stereo"])
     counts["after_stereo"] = len(df)
+    if df.empty:
+        print("\nNo molecules survived stereochemistry filtering. Nothing to do.")
+        sys.exit(1)
     if args.save_intermediates:
         df.to_csv(f"{stem}_04_stereo.csv", index=False)
 
@@ -1092,11 +2183,17 @@ def main():
         df = stage("tautomers", enumerate_tautomers, df,
                    max_tautomers=params["max_tautomers"])
         counts["after_tautomers"] = len(df)
+        if df.empty:
+            print("\nTautomer enumeration produced no valid molecules. Nothing to do.")
+            sys.exit(1)
         if args.save_intermediates:
             df.to_csv(f"{stem}_04b_tautomers.csv", index=False)
 
     df = stage("dedup", deduplicate, df)
     counts["after_dedup"] = len(df)
+    if df.empty:
+        print("\nNo valid molecules remained after deduplication. Nothing to do.")
+        sys.exit(1)
     if args.save_intermediates:
         df.to_csv(f"{stem}_05_deduplicated.csv", index=False)
 
@@ -1105,17 +2202,32 @@ def main():
                    ph_min=params["ph_min"], ph_max=params["ph_max"])
         df = canonical_redup(df)
         counts["after_ionise"] = len(df)
+        if df.empty:
+            print("\nIonisation produced no valid molecules. Nothing to do.")
+            sys.exit(1)
         if args.save_intermediates:
             df.to_csv(f"{stem}_06_ionised.csv", index=False)
 
     
-    meta_csv = f"{stem}_final_metadata.csv"
-    df.to_csv(meta_csv, index=False)
+    meta_csv = Path(f"{stem}_final_metadata.csv")
+    meta_mode = (
+        stat.S_IMODE(meta_csv.stat().st_mode) if meta_csv.is_file() else None
+    )
+    staged_meta_csv = _create_staged_sdf(meta_csv)
+    df.to_csv(staged_meta_csv, index=False)
 
-    final_smi = f"{stem}_final.smi"
-    with open(final_smi, "w") as f:
+    final_smi = Path(f"{stem}_final.smi")
+    final_smi_mode = (
+        stat.S_IMODE(final_smi.stat().st_mode) if final_smi.is_file() else None
+    )
+    staged_final_smi = _create_staged_sdf(final_smi)
+    with open(staged_final_smi, "w") as f:
         for smi, mol_id in zip(df["SMILES"], df["ID"]):
             f.write(f"{smi}\t{mol_id}\n")
+    final_smi_provenance = capture_input_provenance(
+        [staged_final_smi], hash_inputs=not args.no_hash_inputs
+    )[0]
+    final_smi_provenance["role"] = "derived_conformer_input"
 
     n_final = len(df)
     counts["final_2d"] = n_final
@@ -1125,44 +2237,100 @@ def main():
     del df
     gc.collect()
 
+    conf_totals = None
+    disk_estimate = None
     if not args.skip_conformers:
         if not args.skip_disk_check:
-            check_disk_space(args.output, n_final, params["n_conformers"])
+            disk_estimate = check_disk_space(
+                args.output,
+                staged_final_smi,
+                params["n_conformers"],
+                input_provenance=final_smi_provenance,
+            )
 
         conf_totals = stage(
             "conformers", generate_conformers,
-            final_smi, args.output,
+            staged_final_smi, args.output,
             n_conformers=params["n_conformers"],
             chunk_size=args.chunk_size,
             mmff_max_iters=args.mmff_max_iters,
             batch_size=args.batch_size,
             batches_per_gpu=args.batches_per_gpu,
             preprocessing_threads=args.preprocessing_threads,
+            random_seed=args.random_seed,
+            allow_partial_conformers=args.allow_partial_conformers,
+            check_free_space=not args.skip_disk_check,
+            estimated_bytes_per_conformer=(
+                disk_estimate["bytes_per_conformer"] if disk_estimate else None
+            ),
+            output_lock_held=True,
+            before_commit=lambda: verify_input_provenance(input_provenance),
+            input_provenance=final_smi_provenance,
         )
         counts["conformers_written"] = conf_totals["confs"]
+        counts["conformer_molecules_complete"] = conf_totals["successful_mols"]
+        counts["conformer_molecules_incomplete"] = conf_totals["failed_mols"]
+        counts["conformer_shortfall"] = conf_totals["conformer_shortfall"]
+        counts["conformers_unwritten"] = conf_totals["unwritten_conformers"]
+        counts["conformers_policy_dropped"] = conf_totals[
+            "policy_dropped_conformers"
+        ]
+        counts["conformer_retried"] = conf_totals["retried_mols"]
         counts["mmff_unparametrisable"] = conf_totals["mmff_skipped"]
 
     timings["total"] = round(time.time() - t_total, 1)
 
-    manifest_path = f"{stem}_manifest.json"
     runtime_params = dict(params)
     runtime_params.update({
         "chunk_size": args.chunk_size,
         "batch_size": args.batch_size,
         "batches_per_gpu": args.batches_per_gpu,
+        "preprocessing_threads": args.preprocessing_threads,
         "mmff_max_iters": args.mmff_max_iters,
-        "pains_backend": args.pains_backend,
+        "force_field": "MMFF94s",
+        "random_seed": args.random_seed,
+        "allow_partial_conformers": args.allow_partial_conformers,
+        "pains_backend_requested": args.pains_backend,
+        "pains_backend_resolved": resolve_pains_backend(args.pains_backend),
         "custom_smarts": args.custom_smarts,
         "skip_conformers": args.skip_conformers,
+        "disk_estimate": disk_estimate,
     })
-    write_manifest(manifest_path, args, runtime_params, counts, timings,
-                   hash_inputs=not args.no_hash_inputs)
+    verify_input_provenance(input_provenance)
+    verify_input_provenance([final_smi_provenance])
+    if meta_mode is not None:
+        staged_meta_csv.chmod(meta_mode)
+    if final_smi_mode is not None:
+        staged_final_smi.chmod(final_smi_mode)
+    os.replace(staged_meta_csv, meta_csv)
+    os.replace(staged_final_smi, final_smi)
+
+    artifacts = {
+        "final_smiles": final_smi,
+        "final_metadata": meta_csv,
+        "output_sdf": args.output if not args.skip_conformers else None,
+        "conformer_failures": conf_totals["failure_report"] if conf_totals else None,
+        "mmff_unparametrizable": conf_totals["mmff_report"] if conf_totals else None,
+    }
+    write_manifest(
+        manifest_path,
+        args,
+        runtime_params,
+        counts,
+        timings,
+        hash_inputs=not args.no_hash_inputs,
+        artifacts=artifacts,
+        input_provenance=input_provenance,
+    )
 
     print("\n" + "=" * 60)
     print("PIPELINE COMPLETE")
     print("=" * 60)
     print(f"Runtime: {timings['total']:.0f}s ({timings['total'] / 3600:.2f}h)")
-    print(f"Output:  {args.output}")
+    if args.skip_conformers:
+        print(f"2D output: {final_smi}")
+    else:
+        print(f"Output:  {args.output}")
 
 
 if __name__ == "__main__":

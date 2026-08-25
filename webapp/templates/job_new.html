@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}New run · LibPrep{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block body %}
+<div class="app-shell">
+  {% include "_app_header.html" %}
+  <main class="app-main narrow-main">
+    <a class="back-link" href="{{ app_url('/dashboard') }}">← Back to runs</a>
+    <section class="page-heading compact"><div><h1>New preparation run</h1><p>Upload the input files and choose the settings for this run.</p></div></section>
+    {% if error %}<div class="notice error wide-notice">{{ error }}</div>{% endif %}
+    <form class="job-form" action="{{ app_url('/jobs') }}" method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <section class="form-card">
+        <div class="section-copy"><h2>Files</h2><p>Upload up to 20 SMILES or CXSMILES catalogues. Files may be tab- or space-delimited.</p></div>
+        <div class="section-fields full-row">
+          <label class="field-label">Run name <span>Optional</span><input name="name" maxlength="100" placeholder="Example: Enamine REAL August screen"></label>
+          <label class="upload-field" data-file-zone>Supplier files<input name="files" type="file" accept=".smi,.smiles,.cxsmiles,.txt,.tsv" multiple required><small data-file-summary>No files selected. Maximum 20 files.</small></label>
+        </div>
+      </section>
+
+      <section class="form-card">
+        <div class="section-copy"><h2>Preparation settings</h2><p>Start with a preset and change individual settings if required.</p></div>
+        <div class="section-fields full-row">
+          <div class="preset-grid">
+            <label class="preset-option"><input type="radio" name="preset" value="docking" checked data-preset><span><b>Docking</b><small>Single state at pH 7.4 with one conformer.</small></span></label>
+            <label class="preset-option"><input type="radio" name="preset" value="enumerate" data-preset><span><b>Enumeration</b><small>Tautomers and a wider protonation range.</small></span></label>
+          </div>
+          <div class="toggle-grid">
+            <label class="toggle-row"><span><b>Ionisation</b><small>Assign Dimorphite-DL protonation states</small></span><input name="ionise" value="1" type="checkbox" checked><i></i></label>
+            <label class="toggle-row"><span><b>Tautomer enumeration</b><small>Generate alternate tautomeric forms</small></span><input name="tautomers" value="1" type="checkbox"><i></i></label>
+            <label class="toggle-row"><span><b>3D conformers</b><small>Run chunked nvMolKit GPU embedding</small></span><input name="conformers" value="1" type="checkbox" checked><i></i></label>
+            <label class="toggle-row"><span><b>Save intermediates</b><small>Keep CSV output from every stage</small></span><input name="save_intermediates" value="1" type="checkbox"><i></i></label>
+          </div>
+          <div class="field-grid three">
+            <label>Conformers / molecule<input name="n_conformers" type="number" min="1" max="50" value="1"></label>
+            <label>Minimum pH<input name="ph_min" type="number" min="0" max="14" step="0.1" value="7.4"></label>
+            <label>Maximum pH<input name="ph_max" type="number" min="0" max="14" step="0.1" value="7.4"></label>
+            <label>Max unspecified stereo<input name="max_unspecified_stereo" type="number" min="0" max="4" value="2"></label>
+            <label>Max tautomers<input name="max_tautomers" type="number" min="1" max="20" value="5"></label>
+            <label>PAINS backend<select name="pains_backend"><option value="auto">Automatic</option><option value="gpu">GPU</option><option value="cpu">CPU</option></select></label>
+          </div>
+        </div>
+      </section>
+
+      <section class="form-card collapsible-card">
+        <details>
+          <summary><span><b>Advanced GPU settings</b><small>Adjust only for the hardware running this platform.</small></span></summary>
+          <div class="advanced-fields field-grid three">
+            <label>Chunk size<input name="chunk_size" type="number" min="1000" max="1000000" value="100000"></label>
+            <label>Batch size<input name="batch_size" type="number" min="1" max="10000" value="500"></label>
+            <label>Batches / GPU<input name="batches_per_gpu" type="number" min="1" max="32" value="4"></label>
+            <label>Preprocessing threads<input name="preprocessing_threads" type="number" min="1" max="128" value="8"></label>
+            <label>MMFF max iterations<input name="mmff_max_iters" type="number" min="1" max="5000" value="200"></label>
+            <label>Custom rejection SMARTS <span>optional</span><input name="custom_smarts" type="file" accept=".smarts,.txt"></label>
+          </div>
+        </details>
+      </section>
+      <div class="form-actions"><p>The run will enter the queue immediately.</p><button class="button button-primary" type="submit">Create run</button></div>
+    </form>
+  </main>
+</div>
+{% endblock %}

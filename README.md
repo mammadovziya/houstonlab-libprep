@@ -1,154 +1,89 @@
-# Chemical Library Preparation Pipeline
+# HoustonLab LibPrep
 
-Prepares raw supplier catalogues for virtual screening
+HoustonLab LibPrep prepares supplier SMILES and CXSMILES catalogues for virtual
+screening. It cleans and filters the input, expands selected chemical states,
+and generates 3D conformers with nvMolKit on an NVIDIA GPU.
 
-## Steps
+The repository includes a command-line pipeline and a small web app for
+uploading files, queueing runs, and downloading results. It is designed for a
+single Linux GPU server.
 
-1. **Load and merge** supplier catalogues — reads SMILES files from one or more suppliers into a single table, keeping track of original supplier SMILES and IDs throughout.
-2. **Strip salts** — removes counter-ions (Na+, Cl−, etc.) and keeps the largest fragment.
-3. **Filter** — applies BRENK (reactive/unstable groups), Lipinski Rule of Five, ring count/size limits, an aggregator heuristic, and PAINS. Each rejection is logged with the reason.
-4. **Stereoisomer handling** — removes molecules with more than 2 unspecified stereocentres, then enumerates the remaining unspecified ones (up to 4 isomers per molecule). Specified centres are preserved.
-5. **Tautomer enumeration** — generates up to 5 tautomeric forms per molecule using RDKit.
-6. **Deduplication** — canonicalises SMILES and merges duplicates (from different salt forms, enumerated isomers, or overlapping suppliers), keeping all original IDs.
-7. **Ionisation** — enumerates protonation states at pH 6.4–8.4 using Dimorphite-DL, then deduplicates again.
-8. **3D conformer generation** — generates low-energy conformers using rdkonf (Ebejer et al. method), parallelised across 32 cores.
+## What it does
 
-## Requirements
+- keeps supplier IDs while merging and deduplicating catalogues
+- strips salts and applies BRENK, Lipinski, ring, aggregator, PAINS, and custom
+  SMARTS filters
+- enumerates unspecified atom and E/Z stereochemistry
+- optionally enumerates tautomers and protonation states with Dimorphite-DL
+- generates conformers in bounded GPU chunks and minimises them with MMFF94s
+- writes SDF, SMILES, metadata, diagnostic reports, and a JSON run manifest
+
+Runs are strict by default. If a molecule is still missing conformers after a
+retry, the run fails without replacing an earlier completed SDF. Use
+`--allow-partial-conformers` only when an incomplete result is acceptable.
+
+## Command-line use
+
+Create the environment:
 
 ```bash
-conda create -n chem python=3.11
-conda activate chem
-conda install -c conda-forge rdkit
-pip install pandas dimorphite-dl
-git clone https://github.com/stevenshave/rdkonf.git
+conda env create -f environment.yml
+conda activate libprep
 ```
 
-## Benchmarks
-
-Conformer generation throughput, 10 conformers per molecule, Enamine REAL compounds:
-
-| Scale     | Backend   | Hardware    | Output confs | Time     | Throughput         |
-|-----------|-----------|-------------|--------------|----------|--------------------|
-| 10k       | RDKit     | 8 CPU cores | 100k         | 17m      | 95 confs/s         |
-| 10k       | nvMolKit  | 1 GPU       | 100k         | 32s      | 3,100 confs/s      |
-| 100k      | nvMolKit  | 1 GPU       | ~2.0M        | 15m      | 2,737 confs/s      |
-| **1M**    | nvMolKit  | 1 GPU       | **24.7M**    | **3h 39m** | **~1,990 confs/s** (steady-state) |
-
-The 1M run used the chunked runner (200k mols/chunk); throughput is reported
-as steady-state across chunks 6–13 to exclude shared-server contention
-observed during chunks 1–5. End-to-end average including contention: 1,884 confs/s.
-
-Speedup vs. RDKit CPU baseline: **~29×** at production scale.
-
-Hardware: NVIDIA RTX 5090 (32 GB), Intel Xeon server with 8 CPU workers for
-preprocessing.
-
-## Usage
+Prepare one or more supplier files:
 
 ```bash
 python library_pipeline.py \
-    --input supplier1.smi supplier2.smi \
-    --output library_3d.sdf \
-    --rdkonf rdkonf/rdkonf.py \
-    --n-workers 32
+  --input supplier_a.smi supplier_b.smi \
+  --output library.sdf \
+  --preset docking
 ```
 
-### Options
+The `docking` preset uses pH 7.4, skips tautomer enumeration, and creates one
+conformer per molecule. The `enumerate` preset includes tautomers and
+protonation states across pH 6.4–8.4.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input` | (required) | One or more supplier SMILES files |
-| `--output` | library_3d.sdf | Output SDF with 3D coordinates |
-| `--rdkonf` | rdkonf/rdkonf.py | Path to rdkonf script |
-| `--n-workers` | 32 | Parallel workers for conformer generation |
-| `--max-unspecified-stereo` | 2 | Max unspecified stereocentres before rejection |
-| `--max-tautomers` | 5 | Max tautomers per molecule |
-| `--min-ph` / `--max-ph` | 6.4 / 8.4 | pH range for ionisation |
-| `--skip-tautomers` | off | Skip tautomer enumeration |
-| `--skip-ionise` | off | Skip Dimorphite-DL ionisation |
-| `--skip-conformers` | off | Skip 3D generation (output SMILES only) |
-| `--save-intermediates` | off | Save CSV at each step for debugging |
+To run only the 2D preparation stages, add `--skip-conformers`. Run
+`python library_pipeline.py --help` for all available settings.
 
-## Large-scale runs (chunked GPU)
+Input can be space- or tab-delimited:
 
-The built-in `generate_conformers_nvmolkit` loads all molecules into RAM
-before calling `EmbedMolecules`. On servers with <128 GB RAM this OOMs
-around ~1M input molecules (post stereo/tautomer expansion: ~2M+ mols).
+```text
+SMILES ID
+SMILES<TAB>ID
+```
 
-For large runs, use the standalone chunked runner:
+CXSMILES extensions are supported. Common SMILES header rows are skipped.
+
+## Web deployment
+
+The web stack needs Docker Compose, an NVIDIA driver compatible with CUDA 12.6,
+and NVIDIA Container Toolkit.
 
 ```bash
-# First, run the CPU stages of the main pipeline up to ionisation,
-# writing the final SMILES to disk:
-python library_pipeline.py \
-    --input enamine_real_chunk.smi \
-    --output library.sdf \
-    --skip-conformers \
-    --save-intermediates
-
-# Then run conformer generation in bounded-memory chunks:
-python run_conformers_chunked.py \
-    --input library_final.smi \
-    --output library.sdf \
-    --chunk-size 200000 \
-    --n-conformers 10
+cp .env.example .env
+# Set the domain, secret key, data path, and first admin credentials in .env
+docker compose up -d --build
 ```
 
-The runner streams conformers directly to the output SDF, freeing each
-chunk's molecules before loading the next. Memory stays bounded at
-`chunk-size` mols regardless of total input size. Validated at 2.6M mols
-(≈1M input after expansion) producing 24.7M conformers.
+The data directory in `.env` must exist and be writable by UID 10001. Caddy
+handles HTTPS for a dedicated domain. See [DEPLOYMENT.md](DEPLOYMENT.md) for
+server setup, backups, upgrades, and path-based deployment.
 
-Tune `--chunk-size` down to 100k if system RAM is constrained; throughput
-is essentially unchanged.
+## Tests
 
-## Input formats
-
-Supplier files can be either plain SMILES or cxsmiles:
-
-- **Tab-delimited cxsmiles** (Enamine REAL format):
-  `SMILES [|ext|]\tID\t...` — the CXSmiles extension `|...|` lives inside
-  field 0 and is stripped before parsing.
-
-- **Space-delimited SMILES**: `SMILES ID` — extensions, if present as
-  free-standing tokens, are ignored when identifying the compound ID.
-
-Header rows (`SMILES`, `CANONICAL_SMILES`, `SMI`, `SMILE`) are skipped
-automatically.
-
-## Acknowledgements
-
-- [RDKit](https://www.rdkit.org/) — cheminformatics toolkit
-- [Dimorphite-DL](https://github.com/durrantlab/dimorphite_dl) — protonation state enumeration
-- [rdkonf](https://github.com/stevenshave/rdkonf) — conformer generation (Ebejer et al. 2012)
-## GPU backend (nvMolKit)
-
-The pipeline supports GPU-accelerated conformer generation via
-[nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit), which
-implements batch ETKDG + MMFF on CUDA.
-### Requirements
-- NVIDIA GPU with compute capability >= 7.0 (V100 or newer)
-- CUDA driver >= 560.28
-- RDKit 2025.03.1 or 2024.09.6
-
-### Install
 ```bash
-conda install -c conda-forge nvmolkit
+python -m pip install -r requirements-web.txt
+python -m unittest discover -s tests -v
 ```
 
-### Usage
-```bash
-# CPU backend (default)
-python library_pipeline.py --input mols.smi --output lib.sdf
+## Main dependencies
 
-# GPU backend
-python library_pipeline.py --input mols.smi --output lib.sdf \
-    --conformer-backend nvmolkit --n-conformers 10
-```
+[RDKit](https://www.rdkit.org/) ·
+[Dimorphite-DL](https://github.com/durrantlab/dimorphite_dl) ·
+[nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit)
 
-### Notes
-- `useRandomCoords=True` is enforced by nvMolKit; this matches RDKit's
-  recommended setting for flexible molecules.
-- A small fraction of Enamine REAL molecules (~0.04%) contain hypervalent
-  atoms MMFF94s cannot parametrise. These are written to the output SDF
-  without MMFF minimisation, tagged `MMFF_Minimised: False`.
+## License
+
+MIT

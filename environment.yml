@@ -1,0 +1,12 @@
+name: libprep
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cuda-version=12.6
+  - nvmolkit=0.5.*
+  - pandas
+  - pip
+  - pytorch-gpu
+  - pip:
+      - dimorphite-dl

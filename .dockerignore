@@ -1,0 +1,12 @@
+.git
+.venv
+.env*
+data
+.design-qa
+design-qa.md
+__pycache__
+*.pyc
+*.sdf
+*.smi
+*.log
+tests

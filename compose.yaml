@@ -1,0 +1,65 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    environment:
+      LIBPREP_ENV: production
+      LIBPREP_ROOT_PATH: ${LIBPREP_ROOT_PATH:-}
+      LIBPREP_SECRET_KEY: ${LIBPREP_SECRET_KEY:?Set LIBPREP_SECRET_KEY in .env}
+      LIBPREP_ALLOWED_HOSTS: ${LIBPREP_DOMAIN:?Set LIBPREP_DOMAIN in .env},web,127.0.0.1,localhost
+      LIBPREP_SECURE_COOKIES: "true"
+      LIBPREP_REGISTRATION_ENABLED: ${LIBPREP_REGISTRATION_ENABLED:-true}
+      LIBPREP_MAX_UPLOAD_GB: ${LIBPREP_MAX_UPLOAD_GB:-10}
+      LIBPREP_ADMIN_USERNAME: ${LIBPREP_ADMIN_USERNAME:-admin}
+      LIBPREP_ADMIN_EMAIL: ${LIBPREP_ADMIN_EMAIL:-}
+      LIBPREP_ADMIN_NAME: ${LIBPREP_ADMIN_NAME:-Platform administrator}
+      LIBPREP_ADMIN_PASSWORD: ${LIBPREP_ADMIN_PASSWORD:-}
+    volumes:
+      - ${LIBPREP_DATA_PATH:-./data}:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "webapp.worker"]
+    environment:
+      LIBPREP_ENV: production
+      LIBPREP_SECRET_KEY: ${LIBPREP_SECRET_KEY:?Set LIBPREP_SECRET_KEY in .env}
+      LIBPREP_PIPELINE_PYTHON: /opt/conda/bin/python
+    volumes:
+      - ${LIBPREP_DATA_PATH:-./data}:/data
+    depends_on:
+      web:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      LIBPREP_DOMAIN: ${LIBPREP_DOMAIN:?Set LIBPREP_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

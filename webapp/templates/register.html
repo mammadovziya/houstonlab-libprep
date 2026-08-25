@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Request access · LibPrep{% endblock %}
+{% block body_class %}auth-page{% endblock %}
+{% block body %}
+<header class="simple-auth-header wrap"><a class="lab-brand" href="{{ app_url('/') }}"><img src="{{ url_for('static', path='/houstonlab-logo.svg') }}" alt="Houston Lab"><span>LIBPREP</span></a></header>
+<main class="auth-shell">
+  <section class="auth-panel">
+    <div class="auth-card">
+      <h1>Request access</h1>
+      <p class="form-intro">An administrator will review the registration before the account can be used.</p>
+      {% if error %}<div class="notice error">{{ error }}</div>{% endif %}
+      <form class="stack-form" action="{{ app_url('/register') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Full name<input name="display_name" value="{{ form_name or '' }}" autocomplete="name" minlength="2" maxlength="80" required autofocus></label>
+        <label>Email address<input name="email" type="email" value="{{ form_email or '' }}" autocomplete="email" required></label>
+        <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required><small>At least 12 characters</small></label>
+        <label>Confirm password<input name="password_confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label>
+        <button class="button button-primary form-submit" type="submit">Submit request</button>
+      </form>
+      <p class="auth-switch">Already approved? <a href="{{ app_url('/login') }}">Sign in</a></p>
+    </div>
+  </section>
+</main>
+{% endblock %}

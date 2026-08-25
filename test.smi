@@ -1,0 +1,3 @@
+CCN(CC)CCOC1=CC=C(C=C1)C2=CC=CC=C2 test_amine
+CC(C)C1=CC=C(C=C1)C(C)C(=O)O test_acid
+CCOC(=O)N1CCC(CC1)C2=CC=CC=C2 test_amide

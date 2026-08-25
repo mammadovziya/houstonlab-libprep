@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block body_class %}public-page{% endblock %}
+{% block body %}
+<header class="lab-header wrap">
+  <a class="lab-brand" href="https://houstonlab.bio.ed.ac.uk/" aria-label="Houston Lab home">
+    <img src="{{ url_for('static', path='/houstonlab-logo.svg') }}" alt="Houston Lab">
+    <span>LIBPREP</span>
+  </a>
+  <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-navigation" data-nav-toggle>MENU</button>
+  <nav class="site-navigation" id="site-navigation" aria-label="Houston Lab navigation" data-site-nav>
+    <a href="https://houstonlab.bio.ed.ac.uk/">HOME</a>
+    <a href="https://houstonlab.bio.ed.ac.uk/publications">PUBLICATIONS</a>
+    <a href="https://houstonlab.bio.ed.ac.uk/people">PEOPLE</a>
+    <details class="tools-menu">
+      <summary>TOOLS</summary>
+      <div>
+        <a href="https://houstonlab.bio.ed.ac.uk/tools/scorch/">SCORCH</a>
+        <a href="https://houstonlab.bio.ed.ac.uk/tools/autodock-ss/">AutoDock-SS</a>
+        <a href="https://houstonlab.bio.ed.ac.uk/tools/fepops/">FEPOPS</a>
+        <a class="active" href="{{ app_url('/') }}">LIBPREP</a>
+      </div>
+    </details>
+    <a href="https://houstonlab.bio.ed.ac.uk/contact">CONTACT</a>
+  </nav>
+</header>
+
+<main>
+  <section class="tool-intro wrap">
+    <p class="page-label">Houston Lab / Tools</p>
+    <h1>Library preparation</h1>
+    <p class="tool-summary">Prepare SMILES catalogues for virtual screening. Upload supplier files, choose a preparation recipe and download the processed library when the run is complete.</p>
+    <div class="hero-actions">
+      <a class="button button-primary" href="{{ app_url('/login') }}">Sign in</a>
+      {% if registration_enabled %}<a class="button button-secondary" href="{{ app_url('/register') }}">Request access</a>{% endif %}
+    </div>
+  </section>
+
+  <section class="tool-information wrap" aria-label="About LibPrep">
+    <div>
+      <h2>How it works</h2>
+      <ol class="plain-steps">
+        <li><b>Upload files</b><span>Add one or more SMILES or CXSMILES catalogues.</span></li>
+        <li><b>Choose settings</b><span>Use the docking preset or adjust the preparation parameters.</span></li>
+        <li><b>Run preparation</b><span>The worker filters, enumerates and generates conformers.</span></li>
+        <li><b>Download results</b><span>Results, logs and run settings are kept together.</span></li>
+      </ol>
+    </div>
+    <aside>
+      <h2>Access</h2>
+      <p>This service is intended for Houston Lab users and collaborators. New accounts are reviewed before they can submit jobs.</p>
+      <p>For help, contact the platform administrator.</p>
+    </aside>
+  </section>
+</main>
+
+<footer class="site-footer wrap">
+  <strong>© 2026 Houston Lab. All rights reserved</strong>
+  <nav aria-label="Legal"><a href="https://houstonlab.bio.ed.ac.uk/terms_of_use">Terms Of Use</a><a href="https://houstonlab.bio.ed.ac.uk/privacy_policy">Privacy Policy</a></nav>
+</footer>
+{% endblock %}

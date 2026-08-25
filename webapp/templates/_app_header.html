@@ -1,0 +1,21 @@
+<header class="app-header">
+  <a class="lab-brand app-brand" href="{{ app_url('/dashboard') }}" aria-label="LibPrep dashboard">
+    <img src="{{ url_for('static', path='/houstonlab-logo.svg') }}" alt="Houston Lab">
+    <span>LIBPREP</span>
+  </a>
+  <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="workspace-navigation" data-nav-toggle>MENU</button>
+  <nav class="app-navigation" id="workspace-navigation" aria-label="Workspace navigation" data-site-nav>
+    <a class="app-nav-link" href="{{ app_url('/dashboard') }}">RUNS</a>
+    {% if is_staff %}
+      <a class="app-nav-link" href="{{ app_url('/admin/users') }}">ACCESS</a>
+      <a class="app-nav-link" href="{{ app_url('/admin/audit') }}">AUDIT</a>
+    {% endif %}
+  </nav>
+  <div class="user-menu">
+    <span class="user-meta"><b>{{ current_user.display_name }}</b><small>{{ current_user.role }}</small></span>
+    <form action="{{ app_url('/logout') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="text-button" type="submit">Sign out</button>
+    </form>
+  </div>
+</header>

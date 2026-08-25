@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Audit log · LibPrep{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block body %}
+<div class="app-shell">{% include "_app_header.html" %}<main class="app-main">
+  <section class="page-heading dashboard-heading"><div><p class="eyebrow"><span></span> Staff controls</p><h1>Audit log</h1><p>Recent authentication, approval, and workload events.</p></div></section>
+  <section class="table-card"><div class="table-scroll"><table class="runs-table"><thead><tr><th>Event</th><th>Actor</th><th>Target</th><th>IP address</th><th>Time</th></tr></thead><tbody>
+  {% for event in events %}<tr><td><span class="event-name">{{ event.action.replace('_',' ').replace('.',' · ') }}</span></td><td><span>{{ event.actor_name or 'System' }}</span><small>{{ event.actor_email or '' }}</small></td><td>{{ event.target_type }}{% if event.target_id %} · {{ event.target_id[:10] }}{% endif %}</td><td>{{ event.ip_address or 'Not available' }}</td><td>{{ event.created_at | displaytime }}</td></tr>{% else %}<tr><td colspan="5"><div class="empty-inline">No audit events recorded.</div></td></tr>{% endfor %}
+  </tbody></table></div></section>
+</main></div>
+{% endblock %}

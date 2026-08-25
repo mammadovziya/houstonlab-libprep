@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Sign in · LibPrep{% endblock %}
+{% block body_class %}auth-page{% endblock %}
+{% block body %}
+<header class="simple-auth-header wrap"><a class="lab-brand" href="{{ app_url('/') }}"><img src="{{ url_for('static', path='/houstonlab-logo.svg') }}" alt="Houston Lab"><span>LIBPREP</span></a></header>
+<main class="auth-shell">
+  <section class="auth-panel">
+    <div class="auth-card">
+      <h1>Sign in</h1>
+      <p class="form-intro">Use your approved LibPrep account.</p>
+      {% if registered %}<div class="notice success">Registration received. An administrator must approve your account before you can sign in.</div>{% endif %}
+      {% if error %}<div class="notice error">{{ error }}</div>{% endif %}
+      {% if account_status == 'pending' %}<div class="notice pending">Your registration is still waiting for approval.</div>{% endif %}
+      {% if account_status == 'rejected' %}<div class="notice error">This registration was not approved. Contact an administrator if you believe this is a mistake.</div>{% endif %}
+      {% if account_status == 'disabled' %}<div class="notice error">This account has been disabled. Contact an administrator.</div>{% endif %}
+      <form class="stack-form" action="{{ app_url('/login') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>Username or email<input name="identity" type="text" value="{{ form_identity or '' }}" autocomplete="username" required autofocus></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="button button-primary form-submit" type="submit">Sign in</button>
+      </form>
+      {% if registration_enabled %}<p class="auth-switch">Need an account? <a href="{{ app_url('/register') }}">Request access</a></p>{% endif %}
+    </div>
+  </section>
+</main>
+{% endblock %}

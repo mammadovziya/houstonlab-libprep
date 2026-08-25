@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} · LibPrep{% endblock %}
+{% block body %}
+<main class="centered-state">
+  <a class="lab-brand" href="{{ app_url('/') }}"><img src="{{ url_for('static', path='/houstonlab-logo.svg') }}" alt="Houston Lab"><span>LIBPREP</span></a>
+  <section class="state-card"><p class="mini-label">Request error</p><h1>{{ heading }}</h1><p>{{ message }}</p><a class="button button-primary" href="{{ app_url('/') }}">Return home</a></section>
+</main>
+{% endblock %}
